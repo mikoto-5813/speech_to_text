@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased — BigBean fork (`feature/contextual-strings`)
+
+### New
+* `SpeechListenOptions.contextualStrings: List<String>`. Phrases are
+  forwarded to `SFSpeechRecognitionRequest.contextualStrings` on iOS /
+  macOS to bias recognition toward expected words (e.g. `"eye"` vs
+  `"i"`). Apple's docs apply: keep each phrase to one or two words,
+  ≤100 phrases, sayable without pauses, most effective when on-device
+  recognition is OFF. Android & Windows plugins ignore the field.
+* The matching wire-format key on the platform channel is
+  `contextualStrings: List<String>`; older plugin builds will receive
+  it harmlessly (it's read with `?? []`).
+
 ## 7.3.0
 
 ### New

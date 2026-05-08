@@ -1,3 +1,9 @@
+## Unreleased — BigBean fork (`feature/contextual-strings`)
+- Added `contextualStrings: List<String>` to `SpeechListenOptions`,
+  forwarded as `contextualStrings` on the method channel for the
+  platform plugin to consume (currently only honored by the
+  iOS / macOS Swift plugin via `SFSpeechRecognitionRequest.contextualStrings`).
+
 ## 2.3.0
 - Added copyWith to SpeechListenOptions
 

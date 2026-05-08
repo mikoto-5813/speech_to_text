@@ -111,6 +111,10 @@ class MethodChannelSpeechToText extends SpeechToTextPlatform {
       "sampleRate": options?.sampleRate ?? sampleRate,
       "enableHaptics": options?.enableHapticFeedback ?? false,
       "autoPunctuation": options?.autoPunctuation ?? false,
+      // Forwarded straight through to the platform plugin. iOS / macOS use
+      // it to bias `SFSpeechRecognitionRequest.contextualStrings`; other
+      // platforms currently ignore it.
+      "contextualStrings": options?.contextualStrings ?? const <String>[],
     };
     if (null != localeId) {
       listenParams["localeId"] = localeId;

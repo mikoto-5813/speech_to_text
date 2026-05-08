@@ -156,6 +156,10 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
         }
         return
       }
+      // contextualStrings is optional and defaults to an empty array on the
+      // Dart side; tolerate missing/garbage values so older clients still
+      // work against newer plugin builds.
+      let contextualStrings = (argsArr["contextualStrings"] as? [String]) ?? []
       var localeStr: String? = nil
       if let localeParam = argsArr["localeId"] as? String {
         localeStr = localeParam
@@ -175,13 +179,13 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
                 listenForSpeech(
                     result, localeStr: localeStr, partialResults: partialResults, onDevice: onDevice,
                     listenMode: listenMode, sampleRate: sampleRate, autoPunctuation: autoPunctuation,
-                    enableHaptics: enableHaptics)
+                    enableHaptics: enableHaptics, contextualStrings: contextualStrings)
             }
         } else {
             listenForSpeech(
                 result, localeStr: localeStr, partialResults: partialResults, onDevice: onDevice,
                 listenMode: listenMode, sampleRate: sampleRate, autoPunctuation: autoPunctuation,
-                enableHaptics: enableHaptics)
+                enableHaptics: enableHaptics, contextualStrings: contextualStrings)
         }
     case SwiftSpeechToTextMethods.stop.rawValue:
         if #available(iOS 13.0, *) {
@@ -471,7 +475,7 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
   private func listenForSpeech(
     _ result: @escaping FlutterResult, localeStr: String?, partialResults: Bool,
     onDevice: Bool, listenMode: ListenMode, sampleRate: Int, autoPunctuation: Bool,
-    enableHaptics: Bool
+    enableHaptics: Bool, contextualStrings: [String] = []
   ) {
     if nil != currentTask || listening {
       sendBoolResult(false, result)
@@ -560,6 +564,14 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
       }
       if #available(iOS 16.0, macOS 13, *) {
         currentRequest.addsPunctuation = autoPunctuation
+      }
+      // Bias the recognizer toward caller-provided phrases. Apple's docs
+      // (`SFSpeechRecognitionRequest.contextualStrings`) recommend ≤100
+      // 1-2 word phrases that can be spoken without pauses. The biasing is
+      // most effective when on-device recognition is OFF — Apple's cloud
+      // models honor the hint better than the on-device fallback.
+      if !contextualStrings.isEmpty {
+        currentRequest.contextualStrings = contextualStrings
       }
       self.currentTask = self.recognizer?.recognitionTask(with: currentRequest, delegate: self)
       let recordingFormat = inputNode?.outputFormat(forBus: self.busForNodeTap)

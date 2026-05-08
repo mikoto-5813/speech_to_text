@@ -63,6 +63,7 @@ class SpeechListenOptions {
   final sampleRate;
   final autoPunctuation;
   final enableHapticFeedback;
+  final List<String> contextualStrings;
 
   SpeechListenOptions(
       {
@@ -95,7 +96,18 @@ class SpeechListenOptions {
       /// If true haptic feedback will be enabled during the listen session.
       /// Usually haptics are suppressed during speech recognition to avoid
       /// interference with the microphone. Currently only supported on iOS.
-      this.enableHapticFeedback = false});
+      this.enableHapticFeedback = false,
+
+      /// Phrases that the speech recognizer should be biased toward
+      /// recognizing. These are passed straight through to
+      /// `SFSpeechRecognitionRequest.contextualStrings` on iOS / macOS, so
+      /// Apple's own constraints apply: keep each phrase to **one or two
+      /// words**, words must be sayable without pausing, and **no more than
+      /// 100 phrases total**. Most effective when on-device recognition is
+      /// disabled (`onDevice: false`).
+      ///
+      /// Currently only used on iOS / macOS. Ignored on Android & Windows.
+      this.contextualStrings = const <String>[]});
 
   SpeechListenOptions copyWith(
       {bool? cancelOnError,
@@ -104,7 +116,8 @@ class SpeechListenOptions {
       ListenMode? listenMode,
       int? sampleRate,
       bool? autoPunctuation,
-      bool? enableHapticFeedback}) {
+      bool? enableHapticFeedback,
+      List<String>? contextualStrings}) {
     return SpeechListenOptions(
         cancelOnError: cancelOnError ?? this.cancelOnError,
         partialResults: partialResults ?? this.partialResults,
@@ -113,7 +126,8 @@ class SpeechListenOptions {
         sampleRate: sampleRate ?? this.sampleRate,
         autoPunctuation: autoPunctuation ?? this.autoPunctuation,
         enableHapticFeedback:
-            enableHapticFeedback ?? this.enableHapticFeedback);
+            enableHapticFeedback ?? this.enableHapticFeedback,
+        contextualStrings: contextualStrings ?? this.contextualStrings);
   }
 }
 
