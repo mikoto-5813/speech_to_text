@@ -147,6 +147,21 @@ class SpeechToText {
   static final SpeechConfigOption iosNoBluetooth =
       SpeechConfigOption('ios', 'noBluetooth', true);
 
+  /// Pass this option when the host application owns the shared iOS
+  /// `AVAudioSession` lifecycle, i.e. it configures the session category
+  /// itself before playing its own audio. By default the plugin ends every
+  /// listen session by restoring the audio category it remembered and
+  /// calling `AVAudioSession.setActive(false)`. That teardown runs not only
+  /// on [stop] and [cancel] but also when the recognizer finishes on its
+  /// own, which can happen while the application is already playing audio —
+  /// deactivating the shared session at that moment mutes or clips the
+  /// application's playback. With this option the plugin still configures
+  /// the session for recording when [listen] starts, but leaves the session
+  /// completely untouched when listening ends; the application is
+  /// responsible for reconfiguring the session for its own playback.
+  static final SpeechConfigOption iosNoAudioSessionDeactivation =
+      SpeechConfigOption('ios', 'noAudioSessionDeactivation', true);
+
   /// On some mobile web browsers, notably Chrome on Android, the speech
   /// results behave differently. The default behaviour is to aggregate
   /// separate phrases into a single result and return it. On

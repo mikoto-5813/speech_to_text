@@ -95,6 +95,12 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
   private var onDeviceStatus: Bool = false
   private var listening = false
   private var stopping = false
+
+  /// Set through the `noAudioSessionDeactivation` initialize option. When
+  /// true the plugin never restores the remembered audio category nor
+  /// deactivates the shared AVAudioSession when a listen session ends —
+  /// the host app owns the session lifecycle. See stopCurrentListen.
+  private var noAudioSessionDeactivation: Bool = false
   private var audioEngine: AVAudioEngine?
   private var inputNode: AVAudioInputNode?
   private var aggregateResults: SpeechResultAggregator = SpeechResultAggregator()
@@ -130,6 +136,11 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
     case SwiftSpeechToTextMethods.has_permission.rawValue:
       hasPermission(result)
     case SwiftSpeechToTextMethods.initialize.rawValue:
+      if let argsArr = call.arguments as? [String: AnyObject],
+        let noDeactivateOpt = argsArr["noAudioSessionDeactivation"] as? Bool
+      {
+        noAudioSessionDeactivation = noDeactivateOpt
+      }
         if #available(iOS 13.0, *) {
             Task {
                 initialize(result)
@@ -442,23 +453,32 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
         "Error removing trap: %{PUBLIC}@", log: pluginLog, type: .error, error.localizedDescription)
     }
     #if os(iOS)
-      do {
-        if let rememberedAudioCategory = rememberedAudioCategory,
-          let rememberedAudioCategoryOptions = rememberedAudioCategoryOptions
-        {
-          try self.audioSession.setCategory(
-            rememberedAudioCategory, options: rememberedAudioCategoryOptions)
+      // This teardown runs not only on app-requested stop/cancel but also
+      // when the recognizer finishes on its own (didFinishSuccessfully with
+      // !stopping). When the host app owns the AVAudioSession lifecycle the
+      // deactivation below can land mid-playback of the app's own audio and
+      // mute or clip it, so the noAudioSessionDeactivation option skips all
+      // session mutations here and leaves the session exactly as it is.
+      if !noAudioSessionDeactivation {
+        do {
+          if let rememberedAudioCategory = rememberedAudioCategory,
+            let rememberedAudioCategoryOptions = rememberedAudioCategoryOptions
+          {
+            try self.audioSession.setCategory(
+              rememberedAudioCategory, options: rememberedAudioCategoryOptions)
+          }
+        } catch {
+          os_log(
+            "Error stopping listen: %{PUBLIC}@", log: pluginLog, type: .error,
+            error.localizedDescription)
         }
-      } catch {
-        os_log(
-          "Error stopping listen: %{PUBLIC}@", log: pluginLog, type: .error,
-          error.localizedDescription)
-      }
-      do {
-        try self.audioSession.setActive(false, options: .notifyOthersOnDeactivation)
-      } catch {
-        os_log(
-          "Error deactivation: %{PUBLIC}@", log: pluginLog, type: .info, error.localizedDescription)
+        do {
+          try self.audioSession.setActive(false, options: .notifyOthersOnDeactivation)
+        } catch {
+          os_log(
+            "Error deactivation: %{PUBLIC}@", log: pluginLog, type: .info,
+            error.localizedDescription)
+        }
       }
 
     #endif
