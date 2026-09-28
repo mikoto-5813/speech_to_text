@@ -64,6 +64,7 @@ class SpeechListenOptions {
   final autoPunctuation;
   final enableHapticFeedback;
   final List<String> contextualStrings;
+  final String? audioCapturePath;
 
   SpeechListenOptions(
       {
@@ -107,7 +108,29 @@ class SpeechListenOptions {
       /// disabled (`onDevice: false`).
       ///
       /// Currently only used on iOS / macOS. Ignored on Android & Windows.
-      this.contextualStrings = const <String>[]});
+      this.contextualStrings = const <String>[],
+
+      /// Absolute path of a WAV file to record this listen session's
+      /// microphone audio into, or null (the default) to record nothing.
+      ///
+      /// **iOS / macOS only.** The plugin writes the same audio the speech
+      /// recognizer hears, converted to 16 kHz, mono, 16-bit signed integer
+      /// linear PCM. The file is created (or truncated) when listening
+      /// starts, so never reuse a path whose previous recording has not been
+      /// consumed yet. Capturing can never affect recognition: if the file or
+      /// the converter cannot be created, or a write fails, capture is
+      /// switched off for the rest of the session and recognition carries
+      /// on untouched.
+      ///
+      /// The file is finalised when the session ends — stop, cancel, error,
+      /// the recognizer finishing on its own, an audio interruption or a new
+      /// listen — and only then is the outcome reported through the
+      /// platform's `audioCaptured` notification. Do not read the file before
+      /// that notification arrives: until then its header is incomplete.
+      ///
+      /// Android, web and Windows ignore this option: no file is written and
+      /// no `audioCaptured` notification is ever sent.
+      this.audioCapturePath});
 
   SpeechListenOptions copyWith(
       {bool? cancelOnError,
@@ -117,7 +140,8 @@ class SpeechListenOptions {
       int? sampleRate,
       bool? autoPunctuation,
       bool? enableHapticFeedback,
-      List<String>? contextualStrings}) {
+      List<String>? contextualStrings,
+      String? audioCapturePath}) {
     return SpeechListenOptions(
         cancelOnError: cancelOnError ?? this.cancelOnError,
         partialResults: partialResults ?? this.partialResults,
@@ -127,7 +151,8 @@ class SpeechListenOptions {
         autoPunctuation: autoPunctuation ?? this.autoPunctuation,
         enableHapticFeedback:
             enableHapticFeedback ?? this.enableHapticFeedback,
-        contextualStrings: contextualStrings ?? this.contextualStrings);
+        contextualStrings: contextualStrings ?? this.contextualStrings,
+        audioCapturePath: audioCapturePath ?? this.audioCapturePath);
   }
 }
 
@@ -162,6 +187,26 @@ abstract class SpeechToTextPlatform extends PlatformInterface {
   void Function(String error)? onError;
   void Function(String status)? onStatus;
   void Function(double level)? onSoundLevel;
+
+  /// Notified once per listen session that asked for
+  /// [SpeechListenOptions.audioCapturePath], after the capture file has been
+  /// closed. The argument is a JSON object:
+  ///
+  /// * `path` (String) — the `audioCapturePath` of that session.
+  /// * `success` (bool) — false when capturing failed at any point; `path`
+  ///   may then be missing, empty or hold only part of the session.
+  /// * `durationMs` (int) — length of the audio in the file.
+  /// * `sampleRate`, `channels`, `bitsPerSample` (int) — the file's format,
+  ///   always 16000 / 1 / 16 today.
+  /// * `endReason` (String) — what closed the file, e.g. `stop`, `cancel`,
+  ///   `recognizerFinishedReadingAudio`, `interrupted`. Diagnostic only.
+  /// * `errorMsg` (String, optional) — present only when `success` is false.
+  ///
+  /// It is delivered before the `done` status that ends the same session,
+  /// before the reply to the `stop` / `cancel` call that ended it, and before
+  /// the plugin answers the next `listen` call. Only the iOS / macOS plugin
+  /// sends it.
+  void Function(String captureJson)? onAudioCaptured;
 
   /// Returns true if the user has already granted permission to access the
   /// microphone, does not prompt the user.

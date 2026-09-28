@@ -19,6 +19,12 @@ class TestSpeechToTextPlatform extends SpeechToTextPlatform {
   bool listenException = false;
   String listeningStatusResponse = SpeechToText.listeningStatus;
   String? listenLocale;
+  SpeechListenOptions? listenOptions;
+  bool listenResult = true;
+
+  /// Runs inside [listen] before it returns, to play a platform that sends
+  /// notifications before it answers the call.
+  void Function()? duringListen;
   List<String> localesResult = [];
   static const String localeId1 = 'en_US';
   static const String localeId2 = 'fr_CA';
@@ -87,13 +93,15 @@ class TestSpeechToTextPlatform extends SpeechToTextPlatform {
       SpeechListenOptions? options}) async {
     listenInvoked = true;
     listenLocale = localeId;
+    listenOptions = options;
+    duringListen?.call();
     if (listenException) {
       throw PlatformException(
           code: listenExceptionCode,
           message: listenExceptionMessage,
           details: listenExceptionDetails);
     }
-    return true;
+    return listenResult;
   }
 
   @override
@@ -124,6 +132,10 @@ class TestSpeechToTextPlatform extends SpeechToTextPlatform {
 
   void notifySoundLevel() {
     onSoundLevel!(level2);
+  }
+
+  void notifyAudioCaptured(String captureJson) {
+    onAudioCaptured!(captureJson);
   }
 
   void setupLocales() {

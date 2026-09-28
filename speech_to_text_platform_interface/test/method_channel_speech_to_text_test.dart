@@ -1,5 +1,7 @@
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:speech_to_text_platform_interface/method_channel_speech_to_text.dart';
+import 'package:speech_to_text_platform_interface/speech_to_text_platform_interface.dart';
 
 import 'test_speech_channel_handler.dart';
 
@@ -101,6 +103,62 @@ void main() {
     test('passes sampleRate parameter', () async {
       expect(await speechToText?.listen(sampleRate: 10000), isTrue);
       expect(channelHandler.sampleRate, 10000);
+    });
+  });
+  group('listen arguments', () {
+    // The exact payload a listen sent before audio capture existed.
+    const legacyKeys = {
+      'partialResults',
+      'onDevice',
+      'listenMode',
+      'sampleRate',
+      'enableHaptics',
+      'autoPunctuation',
+      'contextualStrings',
+    };
+    test('are unchanged without options', () async {
+      await speechToText?.listen();
+      expect(channelHandler.listenArguments!.keys.toSet(), legacyKeys);
+    });
+    test('are unchanged with options that do not capture', () async {
+      await speechToText?.listen(
+          options: SpeechListenOptions(contextualStrings: ['eye']));
+      expect(channelHandler.listenArguments!.keys.toSet(), legacyKeys);
+      expect(channelHandler.listenArguments!['contextualStrings'], ['eye']);
+    });
+    test('carry audioCapturePath when set', () async {
+      await speechToText?.listen(
+          localeId: TestSpeechChannelHandler.localeId1,
+          options: SpeechListenOptions(audioCapturePath: '/tmp/take.wav'));
+      final args = channelHandler.listenArguments!;
+      expect(args['audioCapturePath'], '/tmp/take.wav');
+      expect(args.keys.toSet(),
+          {...legacyKeys, 'localeId', 'audioCapturePath'});
+    });
+  });
+  group('audioCaptured callback', () {
+    const captureJson = '{"path":"/tmp/take.wav","success":true,'
+        '"durationMs":1234,"sampleRate":16000,"channels":1,'
+        '"bitsPerSample":16,"endReason":"stop"}';
+    test('passes the platform JSON through', () async {
+      String? received;
+      speechToText!.onAudioCaptured = (json) => received = json;
+      await speechToText!.processMethodCall(
+          const MethodCall(MethodChannelSpeechToText.audioCapturedMethod,
+              captureJson));
+      expect(received, captureJson);
+    });
+    test('ignores a payload that is not a string', () async {
+      String? received;
+      speechToText!.onAudioCaptured = (json) => received = json;
+      await speechToText!.processMethodCall(const MethodCall(
+          MethodChannelSpeechToText.audioCapturedMethod, {'path': 'x'}));
+      expect(received, isNull);
+    });
+    test('is harmless with no listener', () async {
+      speechToText!.onAudioCaptured = null;
+      await speechToText!.processMethodCall(const MethodCall(
+          MethodChannelSpeechToText.audioCapturedMethod, captureJson));
     });
   });
   group('control methods invoked as expected', () {

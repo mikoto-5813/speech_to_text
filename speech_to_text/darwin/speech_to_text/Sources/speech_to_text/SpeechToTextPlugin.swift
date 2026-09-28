@@ -26,6 +26,9 @@ public enum SwiftSpeechToTextCallbackMethods: String {
   case notifyStatus
   case notifyError
   case soundLevelChange
+  /// One per listen that asked for `audioCapturePath`, sent once the file is
+  /// closed. The argument is a `SpeechAudioCaptureOutcome` as a JSON string.
+  case audioCaptured
 }
 
 public enum SpeechToTextStatus: String {
@@ -98,6 +101,20 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
   private var audioEngine: AVAudioEngine?
   private var inputNode: AVAudioInputNode?
   private var aggregateResults: SpeechResultAggregator = SpeechResultAggregator()
+  /// The open capture of the current listen, if it asked for one. Swapped
+  /// under `audioCaptureLock` because end signals arrive on the main queue,
+  /// the method-call tasks and notification threads alike.
+  private var audioCapture: SpeechAudioCapture?
+  /// The engine feeding `audioCapture`, so an engine notification can tell
+  /// whether it concerns the open capture without touching `audioEngine`
+  /// from the notification's thread.
+  private weak var audioCaptureEngine: AVAudioEngine?
+  /// The recognition task `audioCapture` belongs to. Delegate callbacks of an
+  /// earlier task keep arriving after the next listen has started, and must
+  /// not close the new session's file.
+  private weak var audioCaptureTask: SFSpeechRecognitionTask?
+  private let audioCaptureLock = NSLock()
+  private var audioCaptureObservers: [NSObjectProtocol] = []
   private let jsonEncoder = JSONEncoder()
   private let busForNodeTap = 0
   private let speechBufferSize: AVAudioFrameCount = 1024
@@ -118,6 +135,12 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
 
     let instance = SpeechToTextPlugin(channel, registrar: registrar)
     registrar.addMethodCallDelegate(instance, channel: channel)
+    #if os(iOS)
+      // Publishing the instance is what makes the engine call
+      // detachFromEngine(for:) when it goes away, which closes an open audio
+      // capture. FlutterMacOS has neither publish nor a detach callback.
+      registrar.publish(instance)
+    #endif
   }
 
   init(_ channel: FlutterMethodChannel, registrar: FlutterPluginRegistrar) {
@@ -160,6 +183,9 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
       // Dart side; tolerate missing/garbage values so older clients still
       // work against newer plugin builds.
       let contextualStrings = (argsArr["contextualStrings"] as? [String]) ?? []
+      // audioCapturePath is optional and only sent when the caller wants the
+      // session recorded; absent means no capture at all.
+      let audioCapturePath = argsArr["audioCapturePath"] as? String
       var localeStr: String? = nil
       if let localeParam = argsArr["localeId"] as? String {
         localeStr = localeParam
@@ -179,13 +205,15 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
                 listenForSpeech(
                     result, localeStr: localeStr, partialResults: partialResults, onDevice: onDevice,
                     listenMode: listenMode, sampleRate: sampleRate, autoPunctuation: autoPunctuation,
-                    enableHaptics: enableHaptics, contextualStrings: contextualStrings)
+                    enableHaptics: enableHaptics, contextualStrings: contextualStrings,
+                    audioCapturePath: audioCapturePath)
             }
         } else {
             listenForSpeech(
                 result, localeStr: localeStr, partialResults: partialResults, onDevice: onDevice,
                 listenMode: listenMode, sampleRate: sampleRate, autoPunctuation: autoPunctuation,
-                enableHaptics: enableHaptics, contextualStrings: contextualStrings)
+                enableHaptics: enableHaptics, contextualStrings: contextualStrings,
+                audioCapturePath: audioCapturePath)
         }
     case SwiftSpeechToTextMethods.stop.rawValue:
         if #available(iOS 13.0, *) {
@@ -379,6 +407,9 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
       return
     }
     stopping = true
+    // finish() stops the recognizer taking audio, so the recording ends here
+    // too, before anything tells Dart that listening stopped.
+    finishAudioCapture(.stop)
     stopAllPlayers()
     self.currentTask?.finish()
     if let sound = successSound {
@@ -400,6 +431,7 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
       return
     }
     stopping = true
+    finishAudioCapture(.cancel)
     stopAllPlayers()
     self.currentTask?.cancel()
     if let sound = cancelSound {
@@ -422,6 +454,10 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
   }
 
   private func stopCurrentListen() {
+    // Normally already closed by the stop / cancel / recognizer signal that
+    // led here; this covers every other way a session is torn down, and it
+    // must happen before `done` below.
+    finishAudioCapture(.listenEnded)
     self.currentRequest?.endAudio()
     stopAllPlayers()
     do {
@@ -475,12 +511,15 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
   private func listenForSpeech(
     _ result: @escaping FlutterResult, localeStr: String?, partialResults: Bool,
     onDevice: Bool, listenMode: ListenMode, sampleRate: Int, autoPunctuation: Bool,
-    enableHaptics: Bool, contextualStrings: [String] = []
+    enableHaptics: Bool, contextualStrings: [String] = [], audioCapturePath: String? = nil
   ) {
     if nil != currentTask || listening {
       sendBoolResult(false, result)
       return
     }
+    // A capture still open here belongs to a session that never reported its
+    // end; close it (and report it) before this session can reuse anything.
+    finishAudioCapture(.superseded)
     do {
       //    let inErrorTest = true
       failedListen = false
@@ -573,7 +612,12 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
       if !contextualStrings.isEmpty {
         currentRequest.contextualStrings = contextualStrings
       }
+      // Opened here, after every early return above and before the task can
+      // report anything, so each capture is closed and reported by one of the
+      // end paths below.
+      let capture = startAudioCapture(path: audioCapturePath)
       self.currentTask = self.recognizer?.recognitionTask(with: currentRequest, delegate: self)
+      bindAudioCapture(capture, to: self.currentTask)
       let recordingFormat = inputNode?.outputFormat(forBus: self.busForNodeTap)
       var fmt: AVAudioFormat!
       #if os(iOS)
@@ -594,6 +638,9 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
           onBus: self.busForNodeTap, bufferSize: self.speechBufferSize, format: fmt
         ) { (buffer: AVAudioPCMBuffer, when: AVAudioTime) in
           currentRequest.append(buffer)
+          // Copies the buffer and returns; conversion and I/O happen on the
+          // capture's own queue, and nothing it does reaches the recognizer.
+          capture?.append(buffer)
           self.updateSoundLevel(buffer: buffer)
         }
       }
@@ -611,6 +658,7 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
       sendBoolResult(true, result)
     } catch {
       failedListen = true
+      finishAudioCapture(.listenFailed)
       os_log(
         "Error starting listen: %{PUBLIC}@", log: pluginLog, type: .error,
         error.localizedDescription)
@@ -634,6 +682,142 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
       }
     }
   }
+
+  /// Opens the capture for a listen that asked for one, on the listen path
+  /// once the engine exists. The converter is built from the first tap
+  /// buffer, so it always matches the format the tap really delivers.
+  private func startAudioCapture(path: String?) -> SpeechAudioCapture? {
+    guard let path = path else {
+      return nil
+    }
+    observeAudioCaptureEndSignals()
+    let capture = SpeechAudioCapture(path: path, log: pluginLog)
+    audioCaptureLock.lock()
+    let previous = audioCapture
+    audioCapture = capture
+    audioCaptureEngine = audioEngine
+    audioCaptureTask = nil
+    audioCaptureLock.unlock()
+    if let previous = previous {
+      // Unreachable in practice (listen closes any open capture first); if it
+      // ever happens, still close and report the old file.
+      reportAudioCapture(previous.finish(reason: .superseded))
+    }
+    return capture
+  }
+
+  private func bindAudioCapture(_ capture: SpeechAudioCapture?, to task: SFSpeechRecognitionTask?) {
+    guard let capture = capture else {
+      return
+    }
+    audioCaptureLock.lock()
+    if audioCapture === capture {
+      audioCaptureTask = task
+    }
+    audioCaptureLock.unlock()
+  }
+
+  /// Closes the current capture, if any, and tells Dart how it went. Safe to
+  /// call from any thread and any number of times: only the first call for a
+  /// capture does anything. Returns once the file is complete, so every
+  /// caller runs it before it reports that listening stopped.
+  ///
+  /// With `onlyFor`, the capture is closed only if that engine feeds it; with
+  /// `onlyForTask`, only if it belongs to that recognition task.
+  private func finishAudioCapture(
+    _ reason: SpeechAudioCaptureEndReason, notify: Bool = true,
+    onlyFor engine: AVAudioEngine? = nil, onlyForTask task: SFSpeechRecognitionTask? = nil
+  ) {
+    audioCaptureLock.lock()
+    if let engine = engine, engine !== audioCaptureEngine {
+      audioCaptureLock.unlock()
+      return
+    }
+    if let task = task, task !== audioCaptureTask {
+      audioCaptureLock.unlock()
+      return
+    }
+    let capture = audioCapture
+    audioCapture = nil
+    audioCaptureEngine = nil
+    audioCaptureTask = nil
+    audioCaptureLock.unlock()
+    guard let outcome = capture?.finish(reason: reason) else {
+      return
+    }
+    if notify {
+      reportAudioCapture(outcome)
+    }
+  }
+
+  private func reportAudioCapture(_ outcome: SpeechAudioCaptureOutcome?) {
+    guard let outcome = outcome else {
+      return
+    }
+    os_log(
+      "Audio capture closed (%{PUBLIC}@): %d ms, success %{PUBLIC}@", log: pluginLog, type: .info,
+      outcome.endReason, outcome.durationMs, outcome.success.description)
+    do {
+      let json = try JSONEncoder().encode(outcome)
+      invokeFlutter(
+        SwiftSpeechToTextCallbackMethods.audioCaptured,
+        arguments: String(data: json, encoding: .utf8))
+    } catch {
+      os_log("Could not encode audio capture JSON", log: pluginLog, type: .error)
+    }
+  }
+
+  /// End signals that do not pass through the recognizer's delegate: the
+  /// engine stopping itself, and (iOS) an audio session interruption. Both
+  /// stop the input tap for good in this plugin, so the file is closed there.
+  /// Registered the first time a listen asks for capture, so a plugin that
+  /// never captures observes nothing new.
+  private func observeAudioCaptureEndSignals() {
+    audioCaptureLock.lock()
+    defer { audioCaptureLock.unlock() }
+    guard audioCaptureObservers.isEmpty else {
+      return
+    }
+    let center = NotificationCenter.default
+    audioCaptureObservers.append(
+      center.addObserver(
+        forName: .AVAudioEngineConfigurationChange, object: nil, queue: nil
+      ) { [weak self] notification in
+        // Posted after the engine has stopped itself; if it is somehow still
+        // running, audio is still flowing and the capture stays open.
+        guard let engine = notification.object as? AVAudioEngine, !engine.isRunning else {
+          return
+        }
+        self?.finishAudioCapture(.engineConfigurationChange, onlyFor: engine)
+      })
+    #if os(iOS)
+      audioCaptureObservers.append(
+        center.addObserver(
+          forName: AVAudioSession.interruptionNotification, object: audioSession, queue: nil
+        ) { [weak self] notification in
+          guard
+            let rawType = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+            AVAudioSession.InterruptionType(rawValue: rawType) == .began
+          else {
+            return
+          }
+          self?.finishAudioCapture(.interrupted)
+        })
+    #endif
+  }
+
+  #if os(iOS)
+    public func detachFromEngine(for registrar: FlutterPluginRegistrar) {
+      // The channel is going away, so there is nobody left to tell; closing
+      // the file still leaves a valid WAV behind.
+      finishAudioCapture(.detached, notify: false)
+      audioCaptureLock.lock()
+      let observers = audioCaptureObservers
+      audioCaptureObservers = []
+      audioCaptureLock.unlock()
+      observers.forEach { NotificationCenter.default.removeObserver($0) }
+    }
+  #endif
 
   private func updateSoundLevel(buffer: AVAudioPCMBuffer) {
     guard
@@ -749,6 +933,8 @@ extension SpeechToTextPlugin: SFSpeechRecognitionTaskDelegate {
   public func speechRecognitionTaskFinishedReadingAudio(_ task: SFSpeechRecognitionTask) {
     reportError(source: "FinishedReadingAudio", error: task.error)
     os_log("Finished reading audio", log: pluginLog, type: .debug)
+    // The recognizer takes no more audio, so neither does the recording.
+    finishAudioCapture(.recognizerFinishedReadingAudio, onlyForTask: task)
     invokeFlutter(
       SwiftSpeechToTextCallbackMethods.notifyStatus,
       arguments: SpeechToTextStatus.notListening.rawValue)
@@ -757,6 +943,7 @@ extension SpeechToTextPlugin: SFSpeechRecognitionTaskDelegate {
   public func speechRecognitionTaskWasCancelled(_ task: SFSpeechRecognitionTask) {
     reportError(source: "TaskWasCancelled", error: task.error)
     os_log("Canceled reading audio", log: pluginLog, type: .debug)
+    finishAudioCapture(.recognizerCancelled, onlyForTask: task)
     invokeFlutter(
       SwiftSpeechToTextCallbackMethods.notifyStatus,
       arguments: SpeechToTextStatus.notListening.rawValue)
@@ -767,6 +954,7 @@ extension SpeechToTextPlugin: SFSpeechRecognitionTaskDelegate {
   ) {
     reportError(source: "FinishSuccessfully", error: task.error)
     os_log("FinishSuccessfully", log: pluginLog, type: .debug)
+    finishAudioCapture(.recognizerFinished, onlyForTask: task)
     if !successfully {
       invokeFlutter(
         SwiftSpeechToTextCallbackMethods.notifyStatus,

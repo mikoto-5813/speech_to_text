@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased — BigBean fork (`feature/audio-capture`)
+
+### New
+* `SpeechListenOptions.audioCapturePath: String?` (default `null`: no
+  capture, and the listen payload is unchanged). On iOS / macOS the plugin
+  converts the same tap buffers it feeds the recognizer to 16 kHz mono
+  16-bit PCM on a serial queue and writes them to that path as a WAV. Any
+  capture failure only switches capture off for that session; recognition
+  is never affected. Audio session category / mode / activation handling
+  is unchanged.
+* `SpeechToText.listen(onAudioCaptured:)` receives a `SpeechAudioCapture`
+  (`path`, `success`, `durationMs`, format, `endReason`, `errorMsg`) once
+  the file is closed. It is sent on every end path — stop, cancel,
+  recognizer finish or error, failed start, audio interruption, engine
+  configuration change, a new listen superseding an open one — and always
+  before that session's `done` status and before the reply to the
+  `stop` / `cancel` that ended it. On iOS the plugin also closes an open
+  file when detached from its engine (it now publishes its instance so the
+  engine calls `detachFromEngine`).
+* Wire format: the listen payload gains `audioCapturePath` only when it is
+  set; the plugin reports on the new `audioCaptured` callback method with
+  a JSON string. Android, web and Windows ignore the key and never send it.
+* `speech_to_text` now needs this fork's `speech_to_text_platform_interface`
+  (`SpeechToTextPlatform.onAudioCaptured`); pin both to the same commit.
+
 ## Unreleased — BigBean fork (`feature/contextual-strings`)
 
 ### New

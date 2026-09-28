@@ -30,5 +30,34 @@ void main() {
       expect(modifiedOptions.autoPunctuation, false);
       expect(modifiedOptions.enableHapticFeedback, false);
     });
+    test('keeps contextualStrings and audioCapturePath when not given', () {
+      final options = SpeechListenOptions(
+        contextualStrings: ['eye'],
+        audioCapturePath: '/tmp/a.wav',
+      );
+      final modifiedOptions = options.copyWith(onDevice: true);
+      expect(modifiedOptions.onDevice, true);
+      expect(modifiedOptions.contextualStrings, ['eye']);
+      expect(modifiedOptions.audioCapturePath, '/tmp/a.wav');
+    });
+    test('sets audioCapturePath', () {
+      final modifiedOptions =
+          SpeechListenOptions().copyWith(audioCapturePath: '/tmp/b.wav');
+      expect(modifiedOptions.audioCapturePath, '/tmp/b.wav');
+    });
+  });
+  group('defaults', () {
+    test('are unchanged, and record no audio', () {
+      final options = SpeechListenOptions();
+      expect(options.cancelOnError, false);
+      expect(options.partialResults, true);
+      expect(options.onDevice, false);
+      expect(options.listenMode, ListenMode.confirmation);
+      expect(options.sampleRate, 0);
+      expect(options.autoPunctuation, false);
+      expect(options.enableHapticFeedback, false);
+      expect(options.contextualStrings, isEmpty);
+      expect(options.audioCapturePath, isNull);
+    });
   });
 }

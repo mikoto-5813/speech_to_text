@@ -30,6 +30,7 @@ class TestSpeechChannelHandler {
   bool? debugLogging;
   int? listenMode = 0;
   int? sampleRate = 0;
+  Map<dynamic, dynamic>? listenArguments;
   dynamic initOption;
   static const String localeId1 = 'en_US';
   static const String localeId2 = 'fr_CA';
@@ -91,6 +92,7 @@ class TestSpeechChannelHandler {
               message: listenExceptionMessage,
               details: listenExceptionDetails);
         }
+        listenArguments = Map<dynamic, dynamic>.from(methodCall.arguments);
         listenLocale = methodCall.arguments['localeId'];
         onDevice = methodCall.arguments['onDevice'];
         partialResults = methodCall.arguments['partialResults'];
@@ -150,6 +152,7 @@ class TestSpeechChannelHandler {
     partialResults = false;
     listenMode = 0;
     sampleRate = 0;
+    listenArguments = null;
     initOption = null;
     debugLogging = null;
   }

@@ -14,6 +14,7 @@ class MethodChannelSpeechToText extends SpeechToTextPlatform {
   static const String notifyErrorMethod = 'notifyError';
   static const String notifyStatusMethod = 'notifyStatus';
   static const String soundLevelChangeMethod = "soundLevelChange";
+  static const String audioCapturedMethod = 'audioCaptured';
 
   /// Returns true if the user has already granted permission to access the
   /// microphone, does not prompt the user.
@@ -119,6 +120,13 @@ class MethodChannelSpeechToText extends SpeechToTextPlatform {
     if (null != localeId) {
       listenParams["localeId"] = localeId;
     }
+    // Only sent when set, so a listen without capture sends exactly the
+    // arguments it always has. iOS / macOS record the session into this
+    // file; other platforms ignore the key.
+    final audioCapturePath = options?.audioCapturePath;
+    if (null != audioCapturePath) {
+      listenParams["audioCapturePath"] = audioCapturePath;
+    }
     return await _channel.invokeMethod<bool>('listen', listenParams) ?? false;
   }
 
@@ -150,6 +158,11 @@ class MethodChannelSpeechToText extends SpeechToTextPlatform {
       case soundLevelChangeMethod:
         if (call.arguments is double && null != onSoundLevel) {
           onSoundLevel!(call.arguments);
+        }
+        break;
+      case audioCapturedMethod:
+        if (call.arguments is String && null != onAudioCaptured) {
+          onAudioCaptured!(call.arguments);
         }
         break;
       default:

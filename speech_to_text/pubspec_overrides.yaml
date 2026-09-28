@@ -1,0 +1,7 @@
+# This fork's speech_to_text needs this fork's platform interface (it uses
+# SpeechListenOptions.audioCapturePath and SpeechToTextPlatform.onAudioCaptured),
+# not the one on pub.dev. Only applies when speech_to_text itself is the root
+# package (tests, analysis); apps pin both packages to the same fork commit.
+dependency_overrides:
+  speech_to_text_platform_interface:
+    path: ../speech_to_text_platform_interface

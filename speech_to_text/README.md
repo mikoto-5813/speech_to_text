@@ -312,6 +312,26 @@ property of any of the values returned in `locales`. A call looks like this:
        );
 ```
 
+### Recording what the recognizer heard (iOS & macOS)
+
+Set `audioCapturePath` in `SpeechListenOptions` and the iOS / macOS plugin writes the session's microphone audio —
+exactly what the recognizer was fed — to that path as a WAV file: 16 kHz, mono, 16-bit signed PCM. The file is only
+complete once `onAudioCaptured` has been called, so read it there and nowhere else:
+
+```dart
+   speech.listen(
+       onResult: resultListener,
+       listenOptions: SpeechListenOptions(audioCapturePath: '${tempDir.path}/take-$id.wav'),
+       onAudioCaptured: (capture) {
+         if (capture.success && capture.durationMs > 0) upload(capture.path);
+       },
+       );
+```
+
+Recording never affects recognition: if the file cannot be written, capture stops for that session, `success` is
+`false`, and recognition carries on. Use a new path for every session. Android, web and Windows ignore the option and
+never call `onAudioCaptured` (see [Recording audio on Android](#recording-audio-on-android)).
+
 ## Troubleshooting
 
 ### Speech recognition not working on iOS Simulator

@@ -179,6 +179,9 @@ public class SpeechToTextPlugin :
                     initialize(result)
                 }
                 "listen" -> {
+                    // "contextualStrings" and "audioCapturePath" are iOS / macOS
+                    // only and deliberately not read here: the platform
+                    // SpeechRecognizer exposes neither biasing nor its audio.
                     var localeId = call.argument<String>("localeId")
                     if (null == localeId) {
                         localeId = defaultLanguageTag

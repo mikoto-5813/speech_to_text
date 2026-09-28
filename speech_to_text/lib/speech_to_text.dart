@@ -5,11 +5,13 @@ import 'dart:math';
 import 'package:clock/clock.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:speech_to_text/speech_audio_capture.dart';
 import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text_platform_interface/speech_to_text_platform_interface.dart';
 export 'package:speech_to_text_platform_interface/speech_to_text_platform_interface.dart'
     show ListenMode, SpeechConfigOption, SpeechListenOptions;
+export 'package:speech_to_text/speech_audio_capture.dart';
 
 /// A single locale with a [name], localized to the current system locale,
 /// and a [localeId] which can be used in the [SpeechToText.listen] method to choose a
@@ -85,6 +87,20 @@ typedef SpeechPhraseAggregator = String Function(List<String> phrases);
 /// the recognition input. See the [onSoundLevelChange] argument on
 /// the [SpeechToText.listen] method for use.
 typedef SpeechSoundLevelChange = Function(double level);
+
+/// Notified once the audio recorded for a listen session is complete.
+///
+/// See the [onAudioCaptured] argument on the [SpeechToText.listen] method.
+typedef SpeechAudioCaptureListener = void Function(SpeechAudioCapture capture);
+
+/// A listen session's `onAudioCaptured` listener, waiting for the plugin to
+/// report the file at [path].
+class _PendingAudioCapture {
+  final String path;
+  final SpeechAudioCaptureListener listener;
+
+  _PendingAudioCapture(this.path, this.listener);
+}
 
 /// An interface to device specific speech recognition services.
 ///
@@ -203,6 +219,7 @@ class SpeechToText {
   SpeechErrorListener? errorListener;
   SpeechStatusListener? statusListener;
   SpeechSoundLevelChange? _soundLevelChange;
+  final List<_PendingAudioCapture> _pendingAudioCaptures = [];
 
   /// This overrides the default phrase aggregator to allow for
   /// different strategies for aggregating multiple phrases into
@@ -321,6 +338,7 @@ class SpeechToText {
     SpeechToTextPlatform.instance.onError = _onNotifyError;
     SpeechToTextPlatform.instance.onStatus = _onNotifyStatus;
     SpeechToTextPlatform.instance.onSoundLevel = _onSoundLevelChange;
+    SpeechToTextPlatform.instance.onAudioCaptured = _onAudioCaptured;
     _initWorked = await SpeechToTextPlatform.instance
         .initialize(debugLogging: debugLogging, options: options);
     return _initWorked;
@@ -441,6 +459,18 @@ class SpeechToText {
   ///
   /// [listenOptions] used to specify the options to use for the listen
   /// session. See [SpeechListenOptions] for details.
+  ///
+  /// [onAudioCaptured] is notified once the session's audio has been written
+  /// to [SpeechListenOptions.audioCapturePath] and the file is complete —
+  /// read the file only from this listener, never on a status change. It is
+  /// called exactly once for a session that started, before that session's
+  /// `done` status; after [stop] it can arrive before the final result, since
+  /// recording ends the moment the recognizer stops taking audio. When [stop]
+  /// or [cancel] ends the session, it has been called by the time their
+  /// future completes. Only iOS and macOS record audio: elsewhere, or when
+  /// [listenOptions] has no `audioCapturePath`, it is never called. Give
+  /// every session its own path; the listener is matched to the session by
+  /// path.
   Future listen(
       {SpeechResultListener? onResult,
       Duration? listenFor,
@@ -455,7 +485,8 @@ class SpeechToText {
       @Deprecated('Use SpeechListenOptions.listenMode instead')
       ListenMode listenMode = ListenMode.confirmation,
       @Deprecated('Use SpeechListenOptions.sampleRate instead') sampleRate = 0,
-      SpeechListenOptions? listenOptions}) async {
+      SpeechListenOptions? listenOptions,
+      SpeechAudioCaptureListener? onAudioCaptured}) async {
     if (!_initWorked) {
       throw SpeechToTextNotInitializedException();
     }
@@ -480,8 +511,17 @@ class SpeechToText {
           sampleRate: sampleRate,
           cancelOnError: cancelOnError,
         );
+    final audioCapturePath = usedOptions.audioCapturePath;
+    _PendingAudioCapture? pendingCapture;
+    if (null != audioCapturePath && null != onAudioCaptured) {
+      // Registered before the platform call: a session that fails to start
+      // after opening its file reports it before listen() returns.
+      pendingCapture = _PendingAudioCapture(audioCapturePath, onAudioCaptured);
+      _pendingAudioCaptures.add(pendingCapture);
+    }
+    var started = false;
     try {
-      var started = await SpeechToTextPlatform.instance
+      started = await SpeechToTextPlatform.instance
           .listen(localeId: localeId, options: usedOptions);
       if (started) {
         _listenStartedAt = clock.now().millisecondsSinceEpoch;
@@ -490,6 +530,23 @@ class SpeechToText {
       }
     } on PlatformException catch (e) {
       throw ListenFailedException(e.message, e.details, e.stacktrace);
+    } finally {
+      _settlePendingAudioCaptures(pendingCapture, started);
+    }
+  }
+
+  /// Drops listeners that can no longer be called, so they do not pile up.
+  void _settlePendingAudioCaptures(
+      _PendingAudioCapture? current, bool started) {
+    if (started) {
+      // The plugin reports a session's capture before it answers the next
+      // listen, so whatever an earlier session still has pending here will
+      // never be reported (for example on a platform that does not record).
+      _pendingAudioCaptures.removeWhere((pending) => pending != current);
+    } else if (null != current) {
+      // Rejected, or failed to start: a file that was opened has already
+      // been reported; one that was not never will be.
+      _pendingAudioCaptures.remove(current);
     }
   }
 
@@ -729,6 +786,16 @@ class SpeechToText {
     if (null != statusListener) {
       statusListener!(status);
     }
+  }
+
+  void _onAudioCaptured(String captureJson) {
+    final capture = SpeechAudioCapture.fromJson(jsonDecode(captureJson));
+    final index = _pendingAudioCaptures
+        .indexWhere((pending) => pending.path == capture.path);
+    if (index < 0) {
+      return;
+    }
+    _pendingAudioCaptures.removeAt(index).listener(capture);
   }
 
   void _onSoundLevelChange(double level) {

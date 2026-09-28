@@ -1,3 +1,12 @@
+## Unreleased — BigBean fork (`feature/audio-capture`)
+- Added `audioCapturePath: String?` to `SpeechListenOptions` (constructor
+  and `copyWith`; default `null`). Sent as `audioCapturePath` in the listen
+  payload only when set, so a listen without it sends exactly what it
+  did before.
+- Added `SpeechToTextPlatform.onAudioCaptured`, fed by the new
+  `audioCaptured` method-channel callback (a JSON string describing the
+  closed capture file). Only the iOS / macOS plugin sends it.
+
 ## Unreleased — BigBean fork (`feature/contextual-strings`)
 - Added `contextualStrings: List<String>` to `SpeechListenOptions`,
   forwarded as `contextualStrings` on the method channel for the
