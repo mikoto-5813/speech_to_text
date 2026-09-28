@@ -101,9 +101,8 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
   private var audioEngine: AVAudioEngine?
   private var inputNode: AVAudioInputNode?
   private var aggregateResults: SpeechResultAggregator = SpeechResultAggregator()
-  /// The open capture of the current listen, if it asked for one. Swapped
-  /// under `audioCaptureLock` because end signals arrive on the main queue,
-  /// the method-call tasks and notification threads alike.
+  /// The open capture of the current listen, if it asked for one. Confined to
+  /// `audioCaptureQueue`, like the two fields below.
   private var audioCapture: SpeechAudioCapture?
   /// The engine feeding `audioCapture`, so an engine notification can tell
   /// whether it concerns the open capture without touching `audioEngine`
@@ -113,7 +112,28 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
   /// earlier task keep arriving after the next listen has started, and must
   /// not close the new session's file.
   private weak var audioCaptureTask: SFSpeechRecognitionTask?
-  private let audioCaptureLock = NSLock()
+  /// Serialises the capture state above and every close of a capture, from
+  /// taking it out of `audioCapture` to queueing its `audioCaptured`.
+  ///
+  /// End signals arrive at the same time on the main queue (recognizer
+  /// delegate, sound-player end), on the cooperative pool (`stop`, `cancel`
+  /// and `listen` run in `Task {}`) and on notification threads (the engine's
+  /// own queue). A lock around the swap alone let the caller that lost the
+  /// race return at once, then queue its `done` and its reply to `stop` while
+  /// the winner was still closing the file, so Dart heard "stopped" before
+  /// `audioCaptured`. Closing inside this queue makes the loser wait until
+  /// the winner has queued `audioCaptured`; whatever it queues on main next
+  /// lands after it.
+  ///
+  /// Entered only through `sync` from threads outside it; nothing that runs
+  /// on it calls back into the plugin or waits on the main queue, so it
+  /// cannot deadlock. A caller can be held for as long as the close takes:
+  /// writing the buffers still pending, normally well under a millisecond.
+  private let audioCaptureQueue = DispatchQueue(
+    label: "com.csdcorp.speechToText.audioCaptureState")
+  /// Guards `audioCaptureObservers` only. Kept apart from `audioCaptureQueue`
+  /// so registering an observer never waits on a close in progress.
+  private let audioCaptureObserversLock = NSLock()
   private var audioCaptureObservers: [NSObjectProtocol] = []
   private let jsonEncoder = JSONEncoder()
   private let busForNodeTap = 0
@@ -692,16 +712,16 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
     }
     observeAudioCaptureEndSignals()
     let capture = SpeechAudioCapture(path: path, log: pluginLog)
-    audioCaptureLock.lock()
-    let previous = audioCapture
-    audioCapture = capture
-    audioCaptureEngine = audioEngine
-    audioCaptureTask = nil
-    audioCaptureLock.unlock()
-    if let previous = previous {
-      // Unreachable in practice (listen closes any open capture first); if it
-      // ever happens, still close and report the old file.
-      reportAudioCapture(previous.finish(reason: .superseded))
+    audioCaptureQueue.sync {
+      let previous = audioCapture
+      audioCapture = capture
+      audioCaptureEngine = audioEngine
+      audioCaptureTask = nil
+      if let previous = previous {
+        // Unreachable in practice (listen closes any open capture first); if
+        // it ever happens, still close and report the old file.
+        reportAudioCapture(previous.finish(reason: .superseded))
+      }
     }
     return capture
   }
@@ -710,17 +730,22 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
     guard let capture = capture else {
       return
     }
-    audioCaptureLock.lock()
-    if audioCapture === capture {
-      audioCaptureTask = task
+    audioCaptureQueue.sync {
+      if audioCapture === capture {
+        audioCaptureTask = task
+      }
     }
-    audioCaptureLock.unlock()
   }
 
   /// Closes the current capture, if any, and tells Dart how it went. Safe to
-  /// call from any thread and any number of times: only the first call for a
-  /// capture does anything. Returns once the file is complete, so every
-  /// caller runs it before it reports that listening stopped.
+  /// call from any thread except `audioCaptureQueue`, any number of times:
+  /// only the first call for a capture closes it.
+  ///
+  /// Every call returns only once no close is in progress: either this call
+  /// closed the file and queued `audioCaptured`, or it waited for the call
+  /// that did. So whatever the caller queues on the main queue afterwards —
+  /// `done`, the reply to `stop` / `cancel` / `listen` — reaches Dart after
+  /// `audioCaptured`, whichever thread won.
   ///
   /// With `onlyFor`, the capture is closed only if that engine feeds it; with
   /// `onlyForTask`, only if it belongs to that recognition task.
@@ -728,25 +753,23 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
     _ reason: SpeechAudioCaptureEndReason, notify: Bool = true,
     onlyFor engine: AVAudioEngine? = nil, onlyForTask task: SFSpeechRecognitionTask? = nil
   ) {
-    audioCaptureLock.lock()
-    if let engine = engine, engine !== audioCaptureEngine {
-      audioCaptureLock.unlock()
-      return
-    }
-    if let task = task, task !== audioCaptureTask {
-      audioCaptureLock.unlock()
-      return
-    }
-    let capture = audioCapture
-    audioCapture = nil
-    audioCaptureEngine = nil
-    audioCaptureTask = nil
-    audioCaptureLock.unlock()
-    guard let outcome = capture?.finish(reason: reason) else {
-      return
-    }
-    if notify {
-      reportAudioCapture(outcome)
+    audioCaptureQueue.sync {
+      if let engine = engine, engine !== audioCaptureEngine {
+        return
+      }
+      if let task = task, task !== audioCaptureTask {
+        return
+      }
+      let capture = audioCapture
+      audioCapture = nil
+      audioCaptureEngine = nil
+      audioCaptureTask = nil
+      guard let outcome = capture?.finish(reason: reason) else {
+        return
+      }
+      if notify {
+        reportAudioCapture(outcome)
+      }
     }
   }
 
@@ -773,8 +796,8 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
   /// Registered the first time a listen asks for capture, so a plugin that
   /// never captures observes nothing new.
   private func observeAudioCaptureEndSignals() {
-    audioCaptureLock.lock()
-    defer { audioCaptureLock.unlock() }
+    audioCaptureObserversLock.lock()
+    defer { audioCaptureObserversLock.unlock() }
     guard audioCaptureObservers.isEmpty else {
       return
     }
@@ -811,10 +834,10 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
       // The channel is going away, so there is nobody left to tell; closing
       // the file still leaves a valid WAV behind.
       finishAudioCapture(.detached, notify: false)
-      audioCaptureLock.lock()
+      audioCaptureObserversLock.lock()
       let observers = audioCaptureObservers
       audioCaptureObservers = []
-      audioCaptureLock.unlock()
+      audioCaptureObserversLock.unlock()
       observers.forEach { NotificationCenter.default.removeObserver($0) }
     }
   #endif

@@ -542,6 +542,9 @@ class SpeechToText {
       // The plugin reports a session's capture before it answers the next
       // listen, so whatever an earlier session still has pending here will
       // never be reported (for example on a platform that does not record).
+      // The iOS / macOS plugin guarantees that ordering by running every
+      // capture close on one serial queue (`audioCaptureQueue`), so a close
+      // still in progress on another thread delays the next listen's reply.
       _pendingAudioCaptures.removeWhere((pending) => pending != current);
     } else if (null != current) {
       // Rejected, or failed to start: a file that was opened has already
