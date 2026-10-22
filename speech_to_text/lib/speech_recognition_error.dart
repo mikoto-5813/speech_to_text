@@ -20,7 +20,20 @@ class SpeechRecognitionError {
   /// the error is resolved.
   final bool permanent;
 
-  SpeechRecognitionError(this.errorMsg, this.permanent);
+  /// Why the error happened, when the platform knows — for diagnostics, not
+  /// for display.
+  ///
+  /// On iOS and macOS: for `error_listen_failed`, the setup step that failed
+  /// and the native error's domain and code (or exception name) with the
+  /// system's description of it, plus the input formats and the route's port
+  /// type; for a recognizer error, its domain, code and description. At most
+  /// 200 characters, never the user's speech or a device name. Null when the
+  /// platform sent none — always on Android and the web — and left out of
+  /// [toJson] then, so a payload without it reads and writes as before.
+  @JsonKey(includeIfNull: false)
+  final String? detail;
+
+  SpeechRecognitionError(this.errorMsg, this.permanent, {this.detail});
 
   factory SpeechRecognitionError.fromJson(Map<String, dynamic> json) =>
       _$SpeechRecognitionErrorFromJson(json);
@@ -28,7 +41,8 @@ class SpeechRecognitionError {
 
   @override
   String toString() {
-    return 'SpeechRecognitionError msg: $errorMsg, permanent: $permanent';
+    final why = detail == null ? '' : ', detail: $detail';
+    return 'SpeechRecognitionError msg: $errorMsg, permanent: $permanent$why';
   }
 
   @override
@@ -36,7 +50,8 @@ class SpeechRecognitionError {
     return identical(this, other) ||
         other is SpeechRecognitionError &&
             errorMsg == other.errorMsg &&
-            permanent == other.permanent;
+            permanent == other.permanent &&
+            detail == other.detail;
   }
 
   @override

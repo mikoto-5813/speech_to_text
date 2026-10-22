@@ -11,11 +11,22 @@ SpeechRecognitionError _$SpeechRecognitionErrorFromJson(
     SpeechRecognitionError(
       json['errorMsg'] as String,
       json['permanent'] as bool,
+      detail: json['detail'] as String?,
     );
 
 Map<String, dynamic> _$SpeechRecognitionErrorToJson(
-        SpeechRecognitionError instance) =>
-    <String, dynamic>{
-      'errorMsg': instance.errorMsg,
-      'permanent': instance.permanent,
-    };
+    SpeechRecognitionError instance) {
+  final val = <String, dynamic>{
+    'errorMsg': instance.errorMsg,
+    'permanent': instance.permanent,
+  };
+
+  void writeNotNull(String key, dynamic value) {
+    if (value != null) {
+      val[key] = value;
+    }
+  }
+
+  writeNotNull('detail', instance.detail);
+  return val;
+}

@@ -496,6 +496,21 @@ void main() {
       testPlatform.onError!(TestSpeechChannelHandler.permanentErrorJson);
       expect(listener.speechErrors, 1);
       expect(listener.errors.first.permanent, isTrue);
+      expect(listener.errors.first.detail, isNull);
+      expect(listener.errors.first.toJson().containsKey('detail'), isFalse);
+    });
+    test('passes on the reason the platform gave', () async {
+      const why = 'set_active: NSOSStatusErrorDomain 561017449: '
+          'The operation could not be completed.';
+      await speech.initialize(onError: listener.onSpeechError);
+      await speech.listen();
+      testPlatform.onError!(
+          '{"errorMsg":"error_listen_failed","permanent":true,"detail":"$why"}');
+      expect(listener.speechErrors, 1);
+      expect(listener.errors.first.errorMsg, 'error_listen_failed');
+      expect(listener.errors.first.detail, why);
+      expect(listener.errors.first.toJson()['detail'], why);
+      expect(speech.lastError?.detail, why);
     });
     test('listening unaffected by transient', () async {
       await speech.initialize(onError: listener.onSpeechError);

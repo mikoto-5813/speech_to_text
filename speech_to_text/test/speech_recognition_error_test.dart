@@ -61,4 +61,47 @@ void main() {
       expect(error, roundtripError);
     });
   });
+  group('detail', () {
+    const why = 'install_tap: com.apple.coreaudio.avfaudio: '
+        'required condition is false: format.sampleRate == hwFormat.sampleRate';
+    test('is null when the platform sent none', () {
+      var error = SpeechRecognitionError.fromJson(
+          jsonDecode('{"errorMsg":"$msg1","permanent":true}'));
+      expect(error.detail, isNull);
+    });
+    test('is read when the platform sends one', () {
+      var error = SpeechRecognitionError.fromJson(
+          jsonDecode('{"errorMsg":"$msg1","permanent":true,"detail":"$why"}'));
+      expect(error.errorMsg, msg1);
+      expect(error.permanent, isTrue);
+      expect(error.detail, why);
+    });
+    test('is left out of toJson when null', () {
+      expect(SpeechRecognitionError(msg1, true).toJson(),
+          {'errorMsg': msg1, 'permanent': true});
+    });
+    test('is written by toJson when set', () {
+      expect(SpeechRecognitionError(msg1, true, detail: why).toJson(),
+          {'errorMsg': msg1, 'permanent': true, 'detail': why});
+    });
+    test('roundtrips', () {
+      var error = SpeechRecognitionError(msg1, true, detail: why);
+      expect(SpeechRecognitionError.fromJson(error.toJson()), error);
+      expect(SpeechRecognitionError.fromJson(error.toJson()).detail, why);
+    });
+    test('takes part in equality', () {
+      expect(SpeechRecognitionError(msg1, true, detail: why),
+          SpeechRecognitionError(msg1, true, detail: why));
+      expect(SpeechRecognitionError(msg1, true, detail: why),
+          isNot(SpeechRecognitionError(msg1, true)));
+      expect(SpeechRecognitionError(msg1, true, detail: why),
+          isNot(SpeechRecognitionError(msg1, true, detail: 'other')));
+    });
+    test('is in toString when set, and only then', () {
+      expect(SpeechRecognitionError(msg1, false, detail: why).toString(),
+          'SpeechRecognitionError msg: $msg1, permanent: false, detail: $why');
+      expect(SpeechRecognitionError(msg1, false).toString(),
+          'SpeechRecognitionError msg: $msg1, permanent: false');
+    });
+  });
 }

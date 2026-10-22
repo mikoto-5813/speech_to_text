@@ -68,6 +68,10 @@ struct SpeechRecognitionResult: Codable {
 struct SpeechRecognitionError: Codable {
   let errorMsg: String
   let permanent: Bool
+  /// Why, when the plugin knows: see `SpeechErrorDetail`. Synthesized
+  /// `Codable` leaves a nil detail out of the JSON, so an error without one is
+  /// exactly the payload this struct always sent.
+  var detail: String? = nil
 }
 
 enum SpeechToTextError: Error {
@@ -405,6 +409,21 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
     return inputNode != nil
   }
 
+  /// The input side of a listen, for an error's detail: the input node's
+  /// hardware and bus formats and, on iOS, the session's sample rate and the
+  /// route's input port type — never the port's name, which for a Bluetooth
+  /// device is named after its owner.
+  private func describeInput(hardware: AVAudioFormat?, bus: AVAudioFormat?) -> String {
+    let formats =
+      "hw \(SpeechErrorDetail.describe(hardware)) bus \(SpeechErrorDetail.describe(bus))"
+    #if os(iOS)
+      let port = audioSession.currentRoute.inputs.first?.portType.rawValue ?? "none"
+      return formats + " session \(Int(audioSession.sampleRate)) in \(port)"
+    #else
+      return formats
+    #endif
+  }
+
   private func setupRecognizerForLocale(locale: Locale) {
     if previousLocale == locale {
       return
@@ -540,6 +559,10 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
     // A capture still open here belongs to a session that never reported its
     // end; close it (and report it) before this session can reuse anything.
     finishAudioCapture(.superseded)
+    // What the listen was doing when it failed, and the input it saw: both go
+    // into the detail of the error_listen_failed it then reports.
+    var step = "set_up"
+    var inputContext: String? = nil
     do {
       //    let inErrorTest = true
       failedListen = false
@@ -568,16 +591,21 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
       #if os(iOS)
         rememberedAudioCategory = self.audioSession.category
         rememberedAudioCategoryOptions = self.audioSession.categoryOptions
+        step = "set_category"
         try self.audioSession.setCategory(
           AVAudioSession.Category.playAndRecord,
           options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP, .mixWithOthers])
         //            try self.audioSession.setMode(AVAudioSession.Mode.measurement)
         if sampleRate > 0 {
+          step = "set_preferred_sample_rate"
           try self.audioSession.setPreferredSampleRate(Double(sampleRate))
         }
+        step = "set_mode"
         try self.audioSession.setMode(AVAudioSession.Mode.default)
+        step = "set_active"
         try self.audioSession.setActive(true, options: .notifyOthersOnDeactivation)
         if #available(iOS 13.0, *) {
+          step = "allow_haptics"
           try self.audioSession.setAllowHapticsAndSystemSoundsDuringRecording(enableHaptics)
         }
       #endif
@@ -596,7 +624,18 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
       if !initAudioEngine(result) {
         return
       }
-      if inputNode?.inputFormat(forBus: 0).channelCount == 0 {
+      step = "check_input"
+      // A 0 Hz / 0 ch format on either side of the input node (no input route,
+      // or a session that is being reconfigured) cannot be tapped, and the tap
+      // below no longer passes a format AVFAudio would check: refuse it here,
+      // as a normal error.
+      let hardwareFormat = inputNode?.inputFormat(forBus: busForNodeTap)
+      let busFormat = inputNode?.outputFormat(forBus: busForNodeTap)
+      inputContext = describeInput(hardware: hardwareFormat, bus: busFormat)
+      guard let hardware = hardwareFormat, let bus = busFormat,
+        hardware.sampleRate > 0, hardware.channelCount > 0,
+        bus.sampleRate > 0, bus.channelCount > 0
+      else {
         throw SpeechToTextError.runtimeError("Not enough available inputs.")
       }
       self.currentRequest = SFSpeechAudioBufferRecognitionRequest()
@@ -638,24 +677,30 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
       let capture = startAudioCapture(path: audioCapturePath)
       self.currentTask = self.recognizer?.recognitionTask(with: currentRequest, delegate: self)
       bindAudioCapture(capture, to: self.currentTask)
-      let recordingFormat = inputNode?.outputFormat(forBus: self.busForNodeTap)
-      var fmt: AVAudioFormat!
-      #if os(iOS)
-
-        let theSampleRate = audioSession.sampleRate
-
-        fmt = AVAudioFormat(
-          commonFormat: recordingFormat!.commonFormat, sampleRate: theSampleRate,
-          channels: recordingFormat!.channelCount, interleaved: recordingFormat!.isInterleaved)
-
+      // iOS taps with `format: nil`, the input bus's own format, which AVFAudio
+      // then does not compare with the hardware. A non-nil tap format is
+      // re-checked against the input hardware's sample rate as it is at that
+      // instant, and while the session is still settling after the category
+      // switch (or a preferred sample rate another recorder left behind) the
+      // two can differ: installTap raises "format.sampleRate ==
+      // hwFormat.sampleRate" / "Failed to create tap due to format mismatch",
+      // and the listen fails as error_listen_failed. That format took its rate
+      // from `audioSession.sampleRate`, a second reading of the hardware made at
+      // another moment; it was added (upstream #109) when one engine, and so one
+      // input node with a possibly stale format, lived as long as the plugin,
+      // and a new engine is now made for every listen. The recognizer takes the
+      // node's own format (Apple's sample taps with it), and the audio capture
+      // converts whatever arrives to 16 kHz mono PCM16. macOS keeps the
+      // hardware format it always used.
+      #if os(OSX)
+        let tapFormat = self.inputNode?.inputFormat(forBus: self.busForNodeTap)
       #else
-        let bus = 0
-        fmt = self.inputNode?.inputFormat(forBus: bus)
-
+        let tapFormat: AVAudioFormat? = nil
       #endif
+      step = "install_tap"
       try catchExceptionAsError {
         self.inputNode?.installTap(
-          onBus: self.busForNodeTap, bufferSize: self.speechBufferSize, format: fmt
+          onBus: self.busForNodeTap, bufferSize: self.speechBufferSize, format: tapFormat
         ) { (buffer: AVAudioPCMBuffer, when: AVAudioTime) in
           currentRequest.append(buffer)
           // Copies the buffer and returns; conversion and I/O happen on the
@@ -667,6 +712,7 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
       //    if ( inErrorTest ){
       //        throw SpeechToTextError.runtimeError("for testing only")
       //    }
+      step = "start_engine"
       self.audioEngine?.prepare()
       try self.audioEngine?.start()
       if nil == listeningSound {
@@ -679,16 +725,16 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
     } catch {
       failedListen = true
       finishAudioCapture(.listenFailed)
-      os_log(
-        "Error starting listen: %{PUBLIC}@", log: pluginLog, type: .error,
-        error.localizedDescription)
+      let detail = SpeechErrorDetail.make(step: step, error: error, context: inputContext)
+      os_log("Error starting listen: %{PUBLIC}@", log: pluginLog, type: .error, detail)
       self.invokeFlutter(
         SwiftSpeechToTextCallbackMethods.notifyStatus,
         arguments: SpeechToTextStatus.notListening.rawValue)
       stopCurrentListen()
       sendBoolResult(false, result)
       // ensure the not listening signal is sent in the error case
-      let speechError = SpeechRecognitionError(errorMsg: "error_listen_failed", permanent: true)
+      let speechError = SpeechRecognitionError(
+        errorMsg: "error_listen_failed", permanent: true, detail: detail)
       do {
         let errorResult = try jsonEncoder.encode(speechError)
         invokeFlutter(
@@ -1006,7 +1052,11 @@ extension SpeechToTextPlugin: SFSpeechRecognitionTaskDelegate {
         default:
           errorMsg = "error_unknown (\(err.code))"
         }
-        let speechError = SpeechRecognitionError(errorMsg: errorMsg, permanent: true)
+        // errorMsg keeps the code at most; the domain and the system's own
+        // words travel in the detail.
+        let speechError = SpeechRecognitionError(
+          errorMsg: errorMsg, permanent: true,
+          detail: SpeechErrorDetail.make(step: nil, error: err))
         do {
           let errorResult = try jsonEncoder.encode(speechError)
           invokeFlutter(

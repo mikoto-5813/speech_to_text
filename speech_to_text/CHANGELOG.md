@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased — BigBean fork (`fix/listen-failure-detail`)
+
+### New
+* `SpeechRecognitionError.detail: String?` — why the error happened, when
+  the platform knows. On iOS / macOS, `error_listen_failed` now carries the
+  setup step that failed (`set_category`, `set_active`, `check_input`,
+  `install_tap`, `start_engine`, …), the native error's domain and code — or,
+  for an Objective-C exception, its name and reason — and the system's own
+  description, followed by the input node's hardware and bus formats and
+  (iOS) the session's sample rate and the route's input port TYPE. A
+  recognizer error carries its domain, code and description. At most 200
+  characters; never the user's speech, a file path or a port name; object
+  addresses removed. Absent from the JSON when there is none, so older
+  payloads parse as before and `toJson()` writes no `detail` key for them.
+  Android and the web send none.
+
+### Fixed
+* iOS: the input tap is installed with `format: nil` — the input bus's own
+  format — instead of a format whose sample rate came from
+  `AVAudioSession.sampleRate`. AVFAudio re-checks a non-nil tap format
+  against the input hardware's rate at that instant, and while the session
+  settles after the category switch (or a preferred sample rate left by
+  another recorder) the two can differ; `installTap` then raised and the
+  listen failed. The recognizer request and the audio capture take whatever
+  format the tap delivers (the capture still writes 16 kHz mono PCM16). A
+  0 Hz / 0 ch format on either side of the input node is refused before the
+  tap with the existing "Not enough available inputs." error. macOS is
+  unchanged.
+
 ## Unreleased — BigBean fork (`feature/audio-capture`)
 
 ### New
