@@ -119,6 +119,16 @@ public class SpeechToTextPlugin :
     private val handler: Handler = Handler(Looper.getMainLooper())
     private val defaultLanguageTag: String = Locale.getDefault().toLanguageTag()
 
+    /**
+     * Which listen a recognizer callback belongs to. A session that was stopped is still to
+     * answer, and until it has, the recognizer refuses the next session and its answer would be
+     * taken for the next listen's — see [ListenSessionGate].
+     */
+    private val sessionGate = ListenSessionGate()
+
+    /** Gives up on a replaced session that does not answer; see [armReplacedSessionTimeout]. */
+    private var replacedSessionTimeout: Runnable? = null
+
     override fun onAttachedToEngine(@NonNull flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
 
         onAttachedToEngine(flutterPluginBinding.getApplicationContext(), flutterPluginBinding.getBinaryMessenger());
@@ -131,6 +141,9 @@ public class SpeechToTextPlugin :
     }
 
     override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
+        // A listen still waiting for the session it replaced has nobody left to report to.
+        sessionGate.dropWaitingStart()
+        cancelReplacedSessionTimeout()
         this.pluginContext = null;
         channel?.setMethodCallHandler(null)
         channel = null
@@ -280,15 +293,59 @@ public class SpeechToTextPlugin :
 
         optionallyStartBluetooth()
         setupRecognizerIntent(languageTag, partialResults, listenMode, onDevice )
-        handler.post {
-            run {
-                speechRecognizer?.startListening(recognizerIntent)
+        when (sessionGate.requestStart()) {
+            ListenSessionGate.Start.NOW -> handler.post {
+                run {
+                    startSession()
+                }
+            }
+            ListenSessionGate.Start.AFTER_REPLACED_ANSWER -> {
+                // The session of the listen this one replaces has not answered yet. Started now,
+                // this session would be refused, and that answer taken for this listen's.
+                debugLog("Start listening waits for the replaced session's answer")
+                armReplacedSessionTimeout()
             }
         }
         speechStartTime = System.currentTimeMillis()
         notifyListening(isRecording = true)
         result.success(true)
         debugLog("Start listening done")
+    }
+
+    /** Starts the current listen's session on the recognizer. */
+    private fun startSession() {
+        sessionGate.sessionStarted()
+        speechRecognizer?.startListening(recognizerIntent)
+    }
+
+    /** The replaced session is out of the way: start the listen that waited for it. */
+    private fun startWaitingListen() {
+        cancelReplacedSessionTimeout()
+        startSession()
+    }
+
+    /**
+     * Starts the waiting listen anyway if the session it replaced does not answer within
+     * [ListenSessionGate.REPLACED_SESSION_TIMEOUT_MS]: that session is cancelled, so the
+     * recognizer takes the new one.
+     */
+    private fun armReplacedSessionTimeout() {
+        cancelReplacedSessionTimeout()
+        val timeout = Runnable {
+            replacedSessionTimeout = null
+            if (sessionGate.giveUpOnReplaced()) {
+                debugLog("The replaced session did not answer; cancelling it")
+                speechRecognizer?.cancel()
+                startSession()
+            }
+        }
+        replacedSessionTimeout = timeout
+        handler.postDelayed(timeout, ListenSessionGate.REPLACED_SESSION_TIMEOUT_MS)
+    }
+
+    private fun cancelReplacedSessionTimeout() {
+        replacedSessionTimeout?.let { handler.removeCallbacks(it) }
+        replacedSessionTimeout = null
     }
 
     private fun optionallyStartBluetooth() {
@@ -315,13 +372,21 @@ public class SpeechToTextPlugin :
             return
         }
         debugLog("Stop listening")
-        handler.post {
-            run {
-                speechRecognizer?.stopListening()
+        if (sessionGate.startWaiting) {
+            // This listen never got a session, so there is nothing of it to stop. The session it
+            // replaced is left to answer, and is dropped when it does. Stopping that one again
+            // would only bring an error that looks like its answer.
+            sessionGate.dropWaitingStart()
+            cancelReplacedSessionTimeout()
+        } else {
+            handler.post {
+                run {
+                    speechRecognizer?.stopListening()
+                }
             }
-        }
-        if ( !recognizerStops ) {
-            destroyRecognizer()
+            if ( !recognizerStops ) {
+                destroyRecognizer()
+            }
         }
         notifyListening(isRecording = false)
         result.success(true)
@@ -334,13 +399,24 @@ public class SpeechToTextPlugin :
             return
         }
         debugLog("Cancel listening")
-        handler.post {
-            run {
-                speechRecognizer?.cancel()
+        if (sessionGate.startWaiting) {
+            // As in stopListening: this listen has no session to cancel.
+            sessionGate.dropWaitingStart()
+            cancelReplacedSessionTimeout()
+        } else {
+            handler.post {
+                run {
+                    speechRecognizer?.cancel()
+                    // A cancelled session does not answer. A listen that came in while this
+                    // cancel was on its way would otherwise wait for an answer that never comes.
+                    if (sessionGate.sessionGone()) {
+                        startWaitingListen()
+                    }
+                }
             }
-        }
-        if ( !recognizerStops ) {
-            destroyRecognizer()
+            if ( !recognizerStops ) {
+                destroyRecognizer()
+            }
         }
         notifyListening(isRecording = false)
         result.success(true)
@@ -424,6 +500,10 @@ public class SpeechToTextPlugin :
             debugLog("Discarding duplicate final")
             return
         }
+        sendResults(speechBundle, isFinal)
+    }
+
+    private fun sendResults(speechBundle: Bundle?, isFinal: Boolean) {
         val userSaid = speechBundle?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
         if (null != userSaid && userSaid.isNotEmpty()) {
             val speechResult = JSONObject()
@@ -579,6 +659,8 @@ public class SpeechToTextPlugin :
         lastOnDevice = onDevice
         speechRecognizer?.destroy()
         speechRecognizer = null
+        // Its session went with it: nothing it still owed will be waited for.
+        sessionGate.sessionGone()
         handler.post {
             run {
                 debugLog("Creating recognizer")
@@ -665,7 +747,9 @@ public class SpeechToTextPlugin :
     }
 
     private fun destroyRecognizer() {
-
+        // The session goes with the recognizer, so the next listen does not wait for its answer —
+        // which leaves this path (SDK 29, or alwaysUseStop false) exactly as it was.
+        sessionGate.sessionGone()
         handler.postDelayed( {
                 run {
                     debugLog("Recognizer destroy")
@@ -690,11 +774,53 @@ public class SpeechToTextPlugin :
     }
 
 
-    override fun onPartialResults(results: Bundle?) = updateResults(results, false)
-    override fun onResults(results: Bundle?) = updateResults(results, true)
-    override fun onEndOfSpeech() = notifyListening(isRecording = false)
+    override fun onPartialResults(results: Bundle?) {
+        if (!sessionGate.deliversProgress()) {
+            debugLog("Dropping partial results of a replaced session")
+            return
+        }
+        updateResults(results, false)
+    }
+
+    override fun onResults(results: Bundle?) {
+        // Before the gate: a duplicate is the same answer again, not the next session's.
+        if (isDuplicateFinal(true)) {
+            debugLog("Discarding duplicate final")
+            return
+        }
+        when (sessionGate.answered()) {
+            ListenSessionGate.Answer.DELIVER -> sendResults(results, true)
+            ListenSessionGate.Answer.DROP ->
+                debugLog("Dropping the final results of a replaced session")
+            ListenSessionGate.Answer.DROP_AND_START -> {
+                debugLog("Dropping the final results of a replaced session; starting the next")
+                startWaitingListen()
+            }
+        }
+    }
+
+    override fun onEndOfSpeech() {
+        if (!sessionGate.deliversProgress()) {
+            // Not the current listen's: reporting it would say the current listen stopped.
+            debugLog("Dropping end of speech of a replaced session")
+            return
+        }
+        notifyListening(isRecording = false)
+    }
 
     override fun onError(errorCode: Int) {
+        when (sessionGate.answered()) {
+            ListenSessionGate.Answer.DELIVER -> {}
+            ListenSessionGate.Answer.DROP -> {
+                debugLog("Dropping error $errorCode of a replaced session")
+                return
+            }
+            ListenSessionGate.Answer.DROP_AND_START -> {
+                debugLog("Dropping error $errorCode of a replaced session; starting the next")
+                startWaitingListen()
+                return
+            }
+        }
         val delta = System.currentTimeMillis() - speechStartTime
         var errorReturn = errorCode
         if ( SpeechRecognizer.ERROR_NO_MATCH == errorCode && maxRms < speechThresholdRms ) {
@@ -742,6 +868,8 @@ public class SpeechToTextPlugin :
     }
 
     override fun onRmsChanged(rmsdB: Float) {
+        // A replaced session's sound is not the current listen's, nor its evidence of speech.
+        if (!sessionGate.deliversProgress()) return
         if ( rmsdB < minRms ) {
             minRms = rmsdB
         }

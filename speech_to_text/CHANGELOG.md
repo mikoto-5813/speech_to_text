@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased — BigBean fork (`fix/android-stale-final`)
+
+### Fixed
+* Android: a listen that comes while the recognizer still owes the previous
+  session its answer no longer starts a session, and no longer receives that
+  answer. Stopping a session does not end it — `SpeechRecognizer` first
+  delivers the final result of what it heard (or an error), a network round
+  trip later — and until then it refuses a new session on the same
+  recognizer (`ERROR_CLIENT` from Android 14, `ERROR_RECOGNIZER_BUSY` on
+  11 to 13). The plugin started one anyway, and its single
+  `RecognitionListener` had nothing to tell the two sessions' callbacks
+  apart, so the new listen heard nothing and the old final result went to
+  Dart as the new listen's. The Dart side's guard (`fix/stale-final-across-
+  listens`) drops only what arrives while a new listen waits for the
+  platform's reply, and the Android plugin replies at once.
+  `ListenSessionGate` now holds the new listen until the stopped session has
+  answered: everything that session still reports — partial results, end of
+  speech, sound levels, its answer — is dropped, and its answer starts the
+  new session. A session that has not answered within 1.5 s is cancelled and
+  the new one started. The plugin reports `listening` for the waiting listen
+  at once, as before. A listen that comes when no session is still to answer
+  starts exactly as before; a stop or cancel of a waiting listen touches
+  nothing on the recognizer; SDK 29 (which destroys the recognizer on every
+  stop) is unchanged.
+
+### Tests
+* `android/src/test/kotlin`: JVM tests of `ListenSessionGate`, and of the
+  real plugin on Robolectric's main looper (`SpeechToTextPluginSessionTest`).
+  Run them from an app that depends on this package:
+  `android/gradlew :speech_to_text:testDebugUnitTest`.
+
 ## Unreleased — BigBean fork (`fix/listen-failure-detail`)
 
 ### New

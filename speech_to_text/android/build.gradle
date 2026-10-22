@@ -27,6 +27,7 @@ android {
 
     sourceSets {
         main.java.srcDirs += 'src/main/kotlin'
+        test.java.srcDirs += 'src/test/kotlin'
     }
 
     defaultConfig {
@@ -36,5 +37,14 @@ android {
     lintOptions {
         disable 'InvalidPackage'
     }
+    testOptions {
+        // SpeechToTextPluginSessionTest drives the plugin on Robolectric's main looper.
+        unitTests.includeAndroidResources = true
+    }
 }
 
+dependencies {
+    // JVM unit tests of the plugin's own bookkeeping (src/test/kotlin); not part of the plugin.
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.robolectric:robolectric:4.14.1'
+}
