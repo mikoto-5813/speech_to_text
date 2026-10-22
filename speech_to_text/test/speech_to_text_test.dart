@@ -569,6 +569,81 @@ void main() {
     });
   });
 
+  // A recognizer that was asked to stop finishes what it heard first — on iOS
+  // the final result is a network round trip away — and the next listen can
+  // be asked for before it has. What it reports while the next listen waits
+  // for the platform's answer is the earlier listen's.
+  group('a listen that replaces another', () {
+    test('ignores a final result of the listen it replaces', () async {
+      await speech.initialize();
+      await speech.listen(onResult: listener.onSpeechResult);
+      testPlatform
+          .onTextRecognition!(TestSpeechChannelHandler.firstRecognizedJson);
+      await speech.stop();
+      testPlatform.duringListen = () => testPlatform
+          .onTextRecognition!(TestSpeechChannelHandler.finalRecognizedJson);
+      await speech.listen(onResult: listener.onSpeechResult);
+      testPlatform.duringListen = null;
+      listener.results.clear();
+      testPlatform
+          .onTextRecognition!(TestSpeechChannelHandler.firstRecognizedJson);
+      testPlatform
+          .onTextRecognition!(TestSpeechChannelHandler.secondRecognizedJson);
+      // Taken for this listen's final answer, the earlier final result used
+      // to make this listen drop everything it went on to hear.
+      expect(listener.results.map((r) => r.recognizedWords),
+          ['hello', 'hello there']);
+      expect(listener.results.last.finalResult, isFalse);
+      expect(speech.lastRecognizedWords, 'hello there');
+    });
+
+    test('ignores an error of the listen it replaces', () async {
+      await speech.initialize(onError: listener.onSpeechError);
+      await speech.listen(
+          listenOptions: SpeechListenOptions(cancelOnError: true));
+      await speech.stop();
+      testPlatform.duringListen = testPlatform.notifyPermanentError;
+      await speech.listen(
+          listenOptions: SpeechListenOptions(cancelOnError: true));
+      testPlatform.duringListen = null;
+      expect(listener.speechErrors, 0);
+      expect(speech.hasError, isFalse);
+      // Taken for this listen's, a permanent error cancelled it.
+      expect(testPlatform.cancelInvoked, isFalse);
+      testPlatform.notifyPermanentError();
+      expect(listener.speechErrors, 1);
+    });
+
+    test('keeps the statuses that arrive before the answer', () async {
+      await speech.initialize(onStatus: listener.onSpeechStatus);
+      await speech.listen();
+      await speech.stop();
+      testPlatform.duringListen = testPlatform.notifyListening;
+      await speech.listen();
+      testPlatform.duringListen = null;
+      expect(speech.isListening, isTrue);
+      expect(listener.statuses.last, SpeechToText.listeningStatus);
+    });
+
+    test('a first listen takes what arrives before its answer', () async {
+      await speech.initialize();
+      testPlatform.duringListen = testPlatform.notifyPartialWords;
+      await speech.listen(onResult: listener.onSpeechResult);
+      testPlatform.duringListen = null;
+      expect(listener.results.map((r) => r.recognizedWords), ['hello']);
+    });
+
+    test('takes results again once the platform has answered', () async {
+      await speech.initialize();
+      await speech.listen(onResult: listener.onSpeechResult);
+      await speech.stop();
+      await speech.listen(onResult: listener.onSpeechResult);
+      listener.results.clear();
+      testPlatform.notifyFinalWords();
+      expect(listener.results.single.finalResult, isTrue);
+    });
+  });
+
   group('locales', () {
     test('allows call even if not initialized', () async {
       try {

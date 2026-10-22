@@ -139,6 +139,30 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
   /// so registering an observer never waits on a close in progress.
   private let audioCaptureObserversLock = NSLock()
   private var audioCaptureObservers: [NSObjectProtocol] = []
+  /// Recognition tasks of listens that a later listen has replaced.
+  ///
+  /// A task goes on calling its delegate after it was asked to `finish()`:
+  /// with server recognition its final result is a network round trip away,
+  /// and by then the next listen has often started. Nothing such a task says
+  /// is about the current listen, and passing it on did two kinds of damage:
+  ///
+  ///  * its final result, reported as the new listen's, was taken by the Dart
+  ///    package as that listen's final answer, and the package then drops
+  ///    every later result of the listen — the new listen heard nothing more,
+  ///    with the previous listen's words standing as its transcript;
+  ///  * its `didFinishSuccessfully` ran `stopCurrentListen()` against the NEW
+  ///    listen: its engine stopped, its tap removed, its session deactivated.
+  ///
+  /// So a listen that starts puts the task before it in here, and a callback
+  /// of a task in here only closes that task's own capture. Weak, so a task
+  /// leaves the table once it is gone. Written on the listen path and read on
+  /// the delegate's queue, so behind `staleTasksLock`, like `latestTask`.
+  private let staleTasks = NSHashTable<SFSpeechRecognitionTask>.weakObjects()
+  /// The task the latest listen started, kept after that listen stops: its
+  /// final result may still be on its way, and until another listen starts it
+  /// is still that listen's.
+  private weak var latestTask: SFSpeechRecognitionTask?
+  private let staleTasksLock = NSLock()
   private let jsonEncoder = JSONEncoder()
   private let busForNodeTap = 0
   private let speechBufferSize: AVAudioFrameCount = 1024
@@ -556,6 +580,9 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
       sendBoolResult(false, result)
       return
     }
+    // From here on this listen replaces every earlier one, whose tasks may
+    // still be finishing (see `staleTasks`).
+    retireEarlierTasks()
     // A capture still open here belongs to a session that never reported its
     // end; close it (and report it) before this session can reuse anything.
     finishAudioCapture(.superseded)
@@ -676,6 +703,7 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
       // end paths below.
       let capture = startAudioCapture(path: audioCapturePath)
       self.currentTask = self.recognizer?.recognitionTask(with: currentRequest, delegate: self)
+      adoptLatestTask(self.currentTask)
       bindAudioCapture(capture, to: self.currentTask)
       // iOS taps with `format: nil`, the input bus's own format, which AVFAudio
       // then does not compare with the hardware. A non-nil tap format is
@@ -770,6 +798,38 @@ public class SpeechToTextPlugin: NSObject, FlutterPlugin {
       }
     }
     return capture
+  }
+
+  /// The listen starting now replaces every earlier one: whatever their tasks
+  /// still report is about a listen that is over.
+  private func retireEarlierTasks() {
+    staleTasksLock.lock()
+    defer { staleTasksLock.unlock() }
+    if let previous = latestTask {
+      staleTasks.add(previous)
+    }
+    latestTask = nil
+  }
+
+  private func adoptLatestTask(_ task: SFSpeechRecognitionTask?) {
+    staleTasksLock.lock()
+    defer { staleTasksLock.unlock() }
+    latestTask = task
+  }
+
+  /// True, and logged, when `task` belongs to a listen a later one replaced.
+  /// A task this plugin has not seen yet (the listen starting now, before it
+  /// is adopted) is never stale.
+  private func ignoreIfStale(_ task: SFSpeechRecognitionTask, _ source: String) -> Bool {
+    staleTasksLock.lock()
+    let stale = staleTasks.contains(task)
+    staleTasksLock.unlock()
+    if stale {
+      os_log(
+        "Ignoring %{PUBLIC}@ from the task of a replaced listen", log: pluginLog, type: .info,
+        source)
+    }
+    return stale
   }
 
   private func bindAudioCapture(_ capture: SpeechAudioCapture?, to task: SFSpeechRecognitionTask?) {
@@ -1004,6 +1064,7 @@ extension SpeechToTextPlugin: SFSpeechRecognitionTaskDelegate {
     os_log("Finished reading audio", log: pluginLog, type: .debug)
     // The recognizer takes no more audio, so neither does the recording.
     finishAudioCapture(.recognizerFinishedReadingAudio, onlyForTask: task)
+    if ignoreIfStale(task, "FinishedReadingAudio") { return }
     invokeFlutter(
       SwiftSpeechToTextCallbackMethods.notifyStatus,
       arguments: SpeechToTextStatus.notListening.rawValue)
@@ -1013,6 +1074,7 @@ extension SpeechToTextPlugin: SFSpeechRecognitionTaskDelegate {
     reportError(source: "TaskWasCancelled", error: task.error)
     os_log("Canceled reading audio", log: pluginLog, type: .debug)
     finishAudioCapture(.recognizerCancelled, onlyForTask: task)
+    if ignoreIfStale(task, "TaskWasCancelled") { return }
     invokeFlutter(
       SwiftSpeechToTextCallbackMethods.notifyStatus,
       arguments: SpeechToTextStatus.notListening.rawValue)
@@ -1024,6 +1086,9 @@ extension SpeechToTextPlugin: SFSpeechRecognitionTaskDelegate {
     reportError(source: "FinishSuccessfully", error: task.error)
     os_log("FinishSuccessfully", log: pluginLog, type: .debug)
     finishAudioCapture(.recognizerFinished, onlyForTask: task)
+    // A replaced listen's task must neither report its end as the current
+    // listen's nor end the current listen (`stopCurrentListen()` below).
+    if ignoreIfStale(task, "FinishSuccessfully") { return }
     if !successfully {
       invokeFlutter(
         SwiftSpeechToTextCallbackMethods.notifyStatus,
@@ -1084,6 +1149,7 @@ extension SpeechToTextPlugin: SFSpeechRecognitionTaskDelegate {
   ) {
     os_log("HypothesizeTranscription", log: pluginLog, type: .debug)
     reportError(source: "HypothesizeTranscription", error: task.error)
+    if ignoreIfStale(task, "HypothesizeTranscription") { return }
       handleResult([transcription], isFinal: false, maybeFinal: false)
   }
 
@@ -1095,6 +1161,9 @@ extension SpeechToTextPlugin: SFSpeechRecognitionTaskDelegate {
     os_log(
       "FinishRecognition %{PUBLIC}@", log: pluginLog, type: .debug,
       recognitionResult.isFinal.description)
+    // The final result of a replaced listen is the one that used to stand in
+    // for the next listen's answer.
+    if ignoreIfStale(task, "FinishRecognition") { return }
     var pseudoFinal = false
       if #available(iOS 14.0, macOS 13.0, *) {
           pseudoFinal = recognitionResult.speechRecognitionMetadata != nil

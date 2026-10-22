@@ -207,6 +207,25 @@ class SpeechToText {
   /// True if not listening or the user called cancel / stop, false
   /// if cancel/stop were invoked by timeout or error condition.
   bool _userEnded = false;
+
+  /// Whether [listen] has been called before, so that a listen may have
+  /// something earlier still reporting.
+  bool _listenCalled = false;
+
+  /// [listen] calls that follow an earlier listen and are still waiting for
+  /// the platform's answer.
+  ///
+  /// The platform answers a listen before it reports any result or error of
+  /// it, and it can still be reporting the listen before: a recognizer asked to
+  /// stop finishes what it heard first, and on iOS that final result is a
+  /// network round trip away. Such a report, arriving while the next listen
+  /// waits for its answer, is the earlier listen's — and was taken for the new
+  /// one's. A final result there marked the new listen as finished
+  /// ([_notifiedFinal]), so every result it went on to hear was dropped, and
+  /// the earlier listen's words stood as its transcript. So results and
+  /// errors are ignored until the answer arrives. Statuses are not: the new
+  /// listen's own `listening` comes before its answer.
+  int _replacingListenCalls = 0;
   String _lastRecognized = '';
   String _lastStatus = '';
   double _lastSoundLevel = 0;
@@ -520,6 +539,11 @@ class SpeechToText {
       _pendingAudioCaptures.add(pendingCapture);
     }
     var started = false;
+    // Until the platform answers, whatever it reports belongs to the listen
+    // this one replaces (see [_replacingListenCalls]).
+    final replacing = _listenCalled;
+    _listenCalled = true;
+    if (replacing) _replacingListenCalls++;
     try {
       started = await SpeechToTextPlatform.instance
           .listen(localeId: localeId, options: usedOptions);
@@ -531,6 +555,7 @@ class SpeechToText {
     } on PlatformException catch (e) {
       throw ListenFailedException(e.message, e.details, e.stacktrace);
     } finally {
+      if (replacing) _replacingListenCalls--;
       _settlePendingAudioCaptures(pendingCapture, started);
     }
   }
@@ -688,6 +713,8 @@ class SpeechToText {
 
   void _onTextRecognition(String resultJson) {
     // print('onTextRecognition');
+    // The listen being replaced, not the one waiting for its answer.
+    if (_replacingListenCalls > 0) return;
     Map<String, dynamic> resultMap = jsonDecode(resultJson);
     var speechResult = SpeechRecognitionResult.fromJson(resultMap);
     speechResult = _checkAggregates(speechResult);
@@ -753,6 +780,9 @@ class SpeechToText {
     if (isNotListening && _userEnded) {
       return;
     }
+    // The listen being replaced: neither this listen's error, nor a reason to
+    // cancel it.
+    if (_replacingListenCalls > 0) return;
     Map<String, dynamic> errorMap = jsonDecode(errorJson);
     var speechError = SpeechRecognitionError.fromJson(errorMap);
     _lastError = speechError;
